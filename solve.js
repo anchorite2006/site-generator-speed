@@ -39,24 +39,32 @@ function esc(s) {
 function slugify(text, cache) {
   const hit = cache.get(text);
   if (hit !== undefined) return hit;
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) > 127) { ascii = false; break; }
-  }
   let buf = '';
   let gap = false;
-  const feed = (ch) => {
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code > 127) { ascii = false; break; }
     let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) { gap = buf.length > 0; return; }
+    if (code >= 65 && code <= 90) keep = String.fromCharCode(code + 32);
+    else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = text[i];
+    if (keep === null) { gap = buf.length > 0; continue; }
     if (gap) buf += '-';
     gap = false;
     buf += keep;
-  };
-  if (ascii) {
-    for (let i = 0; i < text.length; i++) feed(text[i]);
-  } else {
+  }
+  if (!ascii) {
+    buf = '';
+    gap = false;
+    const feed = (ch) => {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) { gap = buf.length > 0; return; }
+      if (gap) buf += '-';
+      gap = false;
+      buf += keep;
+    };
     for (const ch of text.normalize('NFKD').replace(/\p{M}/gu, '')) feed(ch);
   }
   let out = buf.slice(0, 64).replace(/-+$/, '');
@@ -78,16 +86,20 @@ function longDate(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
-/** Word count: runs of non-whitespace (JS \s), counted by a manual scan. */
+/** JS \s code units, as a table (charCode -> 1). */
+const WS_TABLE = (() => {
+  const t = new Uint8Array(65536);
+  for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196,
+    8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279]) t[c] = 1;
+  return t;
+})();
+
+/** Word count: runs of non-whitespace (JS \s), counted by a table-driven scan. */
 function wordsOf(text) {
   let n = 0;
   let inW = false;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c === 32 || (c >= 9 && c <= 13) || c === 160 || c === 5760
-      || (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287
-      || c === 12288 || c === 65279;
-    if (ws) inW = false;
+    if (WS_TABLE[text.charCodeAt(i)]) inW = false;
     else if (!inW) {
       inW = true;
       n++;
@@ -280,37 +292,39 @@ function isBlank(line) {
   return true;
 }
 
+/** Whether the char at `j` is escaped: the run of backslashes ending at j-1,
+ * counted from `from` (the old scan pairs escapes starting at `from`), is odd.
+ * Only runs of `\\` matter: every backslash in the run is itself escapable, so
+ * the run pairs up left to right and a leftover one escapes s[j]. */
+function isEscaped(s, from, j) {
+  let n = 0;
+  for (let k = j - 1; k >= from && s[k] === '\\'; k--) n++;
+  return (n & 1) === 1;
+}
+
 /** First index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    if (!ESCAPABLE.has(what[0]) || !isEscaped(s, from, j)) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** First single `*` from `from` (one whose run is not `**`), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') {
-      j++;
-      continue;
-    }
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    if (isEscaped(s, from, j)) { j = s.indexOf('*', j + 1); continue; }
+    if (s[j + 1] === '*') { j = s.indexOf('*', j + 2); continue; }
     return j;
   }
   return -1;
 }
 
 const INLINE_TEST = /[\\`*\[&<>"']/;
+const MD_TEST = /[*`\\[]/;
 
 /**
  * `s` rendered inline; `link(target)` is a link's href. Strings with no markdown
@@ -320,6 +334,7 @@ const INLINE_TEST = /[\\`*\[&<>"']/;
  */
 function inline(s, link) {
   if (!INLINE_TEST.test(s)) return s;
+  if (!MD_TEST.test(s)) return esc(s);
   const next = /[\\`*\[&<>"']/g;
   const out = [];
   let run = 0;
@@ -634,13 +649,35 @@ function truthy(v) {
  */
 function compileTemplate(nodes) {
   let uid = 0;
+  // Whether a node list reads `loop.*` in this scope: var/raw/if paths, and a
+  // nested for's own path (evaluated in this scope). A nested for's body is
+  // skipped: its `loop` is the nested loop, not this one. An include is
+  // conservative: the included template may read this scope's loop.
+  const usesLoop = (ns) => {
+    for (const n of ns) {
+      if (n.kind === 'var' || n.kind === 'raw') {
+        if (n.path[0] === 'loop') return true;
+      } else if (n.kind === 'if') {
+        if (n.path[0] === 'loop') return true;
+        if (usesLoop(n.then)) return true;
+        if (n.els !== null && usesLoop(n.els)) return true;
+      } else if (n.kind === 'for') {
+        if (n.path[0] === 'loop') return true;
+      } else if (n.kind === 'inc') return true;
+    }
+    return false;
+  };
   const gen = (ns, S) => {
     let code = '';
     for (const n of ns) {
       if (n.kind === 'text') code += `o.push(${JSON.stringify(n.text)});`;
-      else if (n.kind === 'var') code += `o.push(esc(txt(L(${S},${JSON.stringify(n.path)}))));`;
-      else if (n.kind === 'raw') code += `o.push(txt(L(${S},${JSON.stringify(n.path)})));`;
-      else if (n.kind === 'if') {
+      else if (n.kind === 'var') {
+        const v = `_v${uid++}`;
+        code += `var ${v}=L(${S},${JSON.stringify(n.path)});o.push(esc(typeof ${v}==='string'?${v}:txt(${v})));`;
+      } else if (n.kind === 'raw') {
+        const v = `_v${uid++}`;
+        code += `var ${v}=L(${S},${JSON.stringify(n.path)});o.push(typeof ${v}==='string'?${v}:txt(${v}));`;
+      } else if (n.kind === 'if') {
         const c = n.not
           ? `!truthy(L(${S},${JSON.stringify(n.path)}))`
           : `truthy(L(${S},${JSON.stringify(n.path)}))`;
@@ -651,10 +688,14 @@ function compileTemplate(nodes) {
         const k = `_i${uid}`;
         const s = `_s${uid}`;
         uid++;
+        // One scope object per loop, mutated per item: rendering is
+        // synchronous, so nothing retains a per-item scope.
         code += `var ${a}=L(${S},${JSON.stringify(n.path)});`
-          + `if(Array.isArray(${a})){for(var ${k}=0;${k}<${a}.length;${k}++){`
-          + `var ${s}={v:{},p:${S}};${s}.v[${JSON.stringify(n.name)}]=${a}[${k}];`
-          + `${s}.v.loop={index:${k}+1,first:${k}===0,last:${k}===${a}.length-1,length:${a}.length};`
+          + `if(Array.isArray(${a})){var ${s}={v:{},p:${S}};for(var ${k}=0;${k}<${a}.length;${k}++){`
+          + `${s}.v[${JSON.stringify(n.name)}]=${a}[${k}];`
+          + (usesLoop(n.body)
+            ? `${s}.v.loop={index:${k}+1,first:${k}===0,last:${k}===${a}.length-1,length:${a}.length};`
+            : '')
           + `${gen(n.body, s)}}}`;
       } else if (n.kind === 'inc') {
         const t = `_t${uid}`;
@@ -821,7 +862,11 @@ export function run(input) {
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCU(x.slug, y.slug));
 
   // Cards, pages, and the render scope shared by every template.
-  const cardOf = (s) => ({
+  const cardCache = new Map();
+  const cardOf = (s) => {
+    const hit = cardCache.get(s);
+    if (hit !== undefined) return hit;
+    const card = {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
@@ -830,13 +875,16 @@ export function run(input) {
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+    };
+    cardCache.set(s, card);
+    return card;
+  };
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const pageOf = (s) => ({
     ...cardOf(s),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
